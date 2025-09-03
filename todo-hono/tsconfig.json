@@ -1,9 +1,11 @@
 {
   "compilerOptions": {
     "esModuleInterop": true,
-    "strict": true,
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "strict": true,
     "types": [
       "bun-types" // add Bun global
     ]

@@ -1,4 +1,4 @@
-import {Database, Statement} from 'bun:sqlite';
+import {SQL} from 'bun';
 import {Context, Hono} from 'hono';
 import {serveStatic} from 'hono/bun';
 import type {FC} from 'hono/jsx';
@@ -7,33 +7,53 @@ import {zValidator} from '@hono/zod-validator';
 import './reload-server';
 
 //-----------------------------------------------------------------------------
-// SQLite preparation
+// CRUD operations
 //-----------------------------------------------------------------------------
 
-const db = new Database('todos.db', {create: true});
-const deleteTodoQuery = db.query('delete from todos where id = ?');
-const getAllTodosQuery = db.query('select * from todos order by description');
-const getTodoQuery = db.query('select * from todos where id = ?');
-const insertTodoQuery = db.query(
-  'insert into todos (description, completed) values (?, 0) returning id'
-);
-const updateTodoDescriptionPS = db.prepare(
-  'update todos set description=? where id = ?'
-);
-const updateTodoStatusPS = db.prepare(
-  'update todos set completed=? where id = ?'
-);
+// See README.md for database setup instructions.
+const db = new SQL('sqlite://./todos.db');
+
+function deleteTodo(id: string): Promise<void> {
+  return db`delete from todos where id=${id}`;
+}
+
+function getAllTodos(): Promise<Todo[]> {
+  return db`select * from todos order by description`;
+}
+
+async function getTodo(id: string): Promise<Todo | undefined> {
+  const todos =
+    (await db`select * from todos where id=${id}`) as unknown as Todo[];
+  return todos[0];
+}
+
+async function insertTodo(description: string): Promise<string> {
+  // prettier-ignore
+  const results = await db`
+    insert into todos (description, completed) values (${description}, 0)
+    returning id
+  ` as unknown as { id: string; }[];
+  return results[0].id;
+}
+
+function updateTodoDescription(id: string, description: string): Promise<Todo> {
+  return db`update todos set description=${description} where id=${id}`;
+}
+
+function updateTodoStatus(id: string, completed: number): Promise<Todo> {
+  return db`update todos set completed=${completed} where id=${id}`;
+}
 
 //-----------------------------------------------------------------------------
 // Utility functions
 //-----------------------------------------------------------------------------
 
-function addTodo(c: Context, description: string) {
+async function addTodo(c: Context, description: string) {
   Bun.sleepSync(500); // enables testing hx-indicator spinner
 
   try {
-    const {id} = insertTodoQuery.get(description) as {id: number};
-    const todo = {id, description, completed: 0};
+    const id = await insertTodo(description);
+    const todo = {id, description, completed: 0} as Todo;
     c.header('HX-Trigger', 'status-change');
     return c.html(
       <>
@@ -52,16 +72,8 @@ function addTodo(c: Context, description: string) {
   }
 }
 
-// This handles two kinds of todo updates, the description or completed status.
-function updateTodo(
-  c: Context,
-  statement: Statement,
-  todo: Todo, // already updated
-  property: 'description' | 'completed'
-) {
+function generateHTML(c: Context, todo: Todo) {
   try {
-    const value = todo[property];
-    statement.run(value, todo.id); // updates database
     return c.html(
       <>
         <TodoItem todo={todo} />
@@ -103,7 +115,7 @@ export const Err: FC<ErrProps> = ({message = ''}) => (
 );
 
 export type Todo = {
-  id: number;
+  id: string;
   description: string;
   completed: number; // 0 or 1 for SQLite compatibility
 };
@@ -171,9 +183,9 @@ const app = new Hono();
 app.use('/*', serveStatic({root: './public'}));
 
 // Delete a given todo ... the D in CRUD.
-app.delete('/todos/:id', idValidator, (c: Context) => {
+app.delete('/todos/:id', idValidator, async (c: Context) => {
   const id = c.req.param('id');
-  deleteTodoQuery.get(id);
+  await deleteTodo(id);
   c.header('HX-Trigger', 'status-change');
 
   // This can be used to demonstrate fading new content into view.
@@ -187,15 +199,10 @@ app.delete('/todos/:id', idValidator, (c: Context) => {
 // Redirect root URL to todo list.
 app.get('/', (c: Context) => c.redirect('/todos'));
 
-// This is used by the endpoints that return JSON and HTML.
-function getAllTodos(): Todo[] {
-  return getAllTodosQuery.all() as Todo[];
-}
-
 // Render the todo list UI ... the R in CRUD.
 // It can also return the todos as JSON.
-app.get('/todos', (c: Context) => {
-  const todos = getAllTodos();
+app.get('/todos', async (c: Context) => {
+  const todos = (await getAllTodos()) as Todo[];
 
   const accept = c.req.header('accept');
   if (accept?.includes('application/json')) {
@@ -215,8 +222,8 @@ app.get('/todos', (c: Context) => {
 });
 
 // Get the status text that is displayed at the top of the page.
-app.get('/todos/status', (c: Context) => {
-  const todos = getAllTodosQuery.all() as Todo[];
+app.get('/todos/status', async (c: Context) => {
+  const todos = (await getAllTodos()) as Todo[];
   const uncompletedCount = todos.filter(todo => !todo.completed).length;
   return c.text(`${uncompletedCount} of ${todos.length} remaining`);
 });
@@ -224,7 +231,7 @@ app.get('/todos/status', (c: Context) => {
 // Update the description of a given todo ... the U in CRUD.
 app.patch('/todos/:id/description', idValidator, async (c: Context) => {
   const id = c.req.param('id');
-  const todo = getTodoQuery.get(id) as Todo;
+  const todo = await getTodo(id);
   if (!todo) return c.notFound();
 
   const formData = await c.req.formData();
@@ -240,18 +247,20 @@ app.patch('/todos/:id/description', idValidator, async (c: Context) => {
 
   todo.description = description;
   c.header('HX-Trigger', 'description-change');
-  return updateTodo(c, updateTodoDescriptionPS, todo, 'description');
+  await updateTodoDescription(id, description);
+  return generateHTML(c, todo);
 });
 
 // Toggle the completed state of a given todo ... the U in CRUD.
-app.patch('/todos/:id/toggle-complete', idValidator, (c: Context) => {
+app.patch('/todos/:id/toggle-complete', idValidator, async (c: Context) => {
   const id = c.req.param('id');
-  const todo = getTodoQuery.get(id) as Todo;
+  const todo = await getTodo(id);
   if (!todo) return c.notFound();
 
   todo.completed = 1 - todo.completed;
   c.header('HX-Trigger', 'status-change');
-  return updateTodo(c, updateTodoStatusPS, todo, 'completed');
+  await updateTodoStatus(id, todo.completed);
+  return generateHTML(c, todo);
 });
 
 // Add a new todo ... the C in CRUD.
